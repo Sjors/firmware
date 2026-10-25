@@ -43,6 +43,7 @@ freeze_as_mpy('', [
 	'pincodes.py',
 	'precomp_tag_hash.py',
 	'psbt.py',
+	'anti_exfil.py',
 	'psram.py',
 	'pwsave.py',
 	'qrs.py',

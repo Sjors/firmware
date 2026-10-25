@@ -707,7 +707,8 @@ class psbtInputProxy(psbtProxy):
         'taproot_merkle_root', 'taproot_script_sigs', 'taproot_scripts',
         'taproot_subpaths', 'taproot_internal_key', 'taproot_key_sig', 'tr_added_sigs',
         'ik_idx', 'musig_pubkeys', 'musig_pubnonces', 'musig_part_sigs', 'musig_agg_idx',
-        'musig_added_pubnonces', 'musig_added_sigs', 'wif_key', 'wif_redeem_script'
+        'musig_added_pubnonces', 'musig_added_sigs', 'wif_key', 'wif_redeem_script',
+        'ae_request', 'ae_added_nonce'
     )
 
     def __init__(self, fd, idx):
@@ -1307,6 +1308,10 @@ class psbtInputProxy(psbtProxy):
 
         if self.taproot_key_sig:
             wr(PSBT_IN_TAP_KEY_SIG, self.taproot_key_sig)
+
+        if self.ae_added_nonce:
+            pubkey, nonce = self.ae_added_nonce
+            wr(PSBT_PROPRIETARY, nonce, b'\x02ae\x01' + pubkey)
 
         if self.sighash is not None:
             wr(PSBT_IN_SIGHASH_TYPE, pack('<I', self.sighash))
@@ -2860,6 +2865,30 @@ class psbtObject(psbtProxy):
         if my_xfp is None:
             my_xfp = self.my_xfp
 
+        # Validate the complete protected request before deriving a nonce or
+        # signing any input. The host independently freezes the transaction
+        # across rounds; deterministic nonce derivation binds our key/message/h.
+        from anti_exfil import read_fields
+        read_fields(self, allowed=False)
+        for output in self.outputs:
+            read_fields(output, allowed=False)
+        ae_phase = None
+        for inp in self.inputs:
+            request = read_fields(inp)
+            if request is None:
+                continue
+            pubkey, fields = request
+            assert inp.af == AF_P2TR and inp.sp_idxs, 'Anti-exfil needs owned Taproot input'
+            assert inp.utxo_spk == b'\x51\x20' + pubkey, 'Anti-exfil output key'
+            assert inp.sighash in (None, SIGHASH_DEFAULT, SIGHASH_ALL), 'Anti-exfil sighash'
+            assert not inp.taproot_key_sig and not inp.taproot_script_sigs, 'Signed anti-exfil target'
+            assert not inp.is_musig and not self.session, 'Anti-exfil is single signer only'
+            assert not inp.is_miniscript and not inp.taproot_merkle_root, 'Anti-exfil currently requires BIP86'
+            phase = 2 if 2 in fields else 1
+            assert ae_phase is None or ae_phase == phase, 'Mixed anti-exfil rounds'
+            ae_phase = phase
+            inp.ae_request = (pubkey, fields, inp.sighash)
+
         musig_session = None
         session_id = None
         session_rand = None
@@ -2880,7 +2909,7 @@ class psbtObject(psbtProxy):
 
         store_session = False
         try:
-            self._sign_it(alternate_secret, my_xfp, musig_session)
+            self._sign_it(alternate_secret, my_xfp, musig_session, ae_phase)
             store_session = self.allow_cache_store is True
         finally:
             if musig_session:
@@ -2889,7 +2918,7 @@ class psbtObject(psbtProxy):
                 else:
                     stash.blank_object(session_rand)
 
-    def _sign_it(self, alternate_secret, my_xfp, musig_session):
+    def _sign_it(self, alternate_secret, my_xfp, musig_session, ae_phase):
         # txn is approved. sign all inputs we can sign. add signatures
         # - hash the txn first
         # - sign all inputs we have the key for
@@ -2954,6 +2983,10 @@ class psbtObject(psbtProxy):
                 dis.progress_sofar(in_idx, self.num_inputs)
 
                 inp = self.inputs[in_idx]
+
+                if ae_phase is not None and inp.ae_request is None:
+                    # A protected request must not add unprotected signatures.
+                    continue
 
                 if not inp.has_utxo():
                     # maybe they didn't provide the UTXO
@@ -3165,7 +3198,20 @@ class psbtObject(psbtProxy):
                             if sv.deltamode:
                                 digest = ngu.hash.sha256d(digest)
 
-                            sig = ngu.secp256k1.sign_schnorr(kpt, digest, ngu.random.bytes(32))
+                            if inp.ae_request:
+                                pubkey, fields, declared_sighash = inp.ae_request
+                                assert kpt.xonly_pubkey().to_bytes() == pubkey, 'Anti-exfil signing key'
+                                if ae_phase == 1:
+                                    nonce = ngu.secp256k1.anti_exfil_commit(kpt, digest, fields[0])
+                                    inp.ae_added_nonce = (pubkey, nonce)
+                                    del kpt, kp
+                                    stash.blank_object(sk)
+                                    stash.blank_object(node)
+                                    del sk, node
+                                    continue
+                                sig = ngu.secp256k1.anti_exfil_sign(kpt, digest, fields[0], fields[1], fields[2])
+                            else:
+                                sig = ngu.secp256k1.sign_schnorr(kpt, digest, ngu.random.bytes(32))
                             if inp.sighash != SIGHASH_DEFAULT:
                                 sig += bytes([inp.sighash])
 
@@ -3266,7 +3312,10 @@ class psbtObject(psbtProxy):
                     if self.is_v2:
                         self.set_modifiable_flag(inp)
 
-                if drop_sighash:
+                if inp.ae_request:
+                    # Preserve both explicit DEFAULT and an absent declaration.
+                    inp.sighash = inp.ae_request[2]
+                elif drop_sighash:
                     # only drop after modifiable is set, in case of PSBTv2
                     # SIGHASH_DEFAULT if taproot
                     # SIGHASH_ALL if non-taproot
